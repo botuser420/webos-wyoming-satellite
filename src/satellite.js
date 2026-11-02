@@ -4,6 +4,7 @@ const { EventEmitter } = require('node:events');
 const { encode, Parser } = require('./wyoming');
 const { createLuna } = require('./luna');
 const { Mic } = require('./mic');
+const { Playback } = require('./playback');
 const pkg = require('../package.json');
 
 const MIC_FORMAT = { rate: 16000, width: 2, channels: 1 };
@@ -24,6 +25,18 @@ class Satellite extends EventEmitter {
       area: null,
       maxRunSeconds: 15,
       chunkBytes: 2048,
+      pacat: '/usr/bin/pacat',
+      sink: 'ptts',
+      playLeadMs: 120,
+      holdMs: 350,
+      wakeSound: null,
+      doneSound: null,
+      wakeSoundMaxDelayMs: 500,
+      duckLevel: null,
+      duckApps: [],
+      warmUpMaxSeconds: 15,
+      answerTimeoutSeconds: 10,
+      maxQueueSeconds: 120,
       ...opts,
     };
     this.log = (level, msg) => (opts.log || defaultLog)(level, msg);
@@ -43,6 +56,12 @@ class Satellite extends EventEmitter {
         this.emit('mic-status', s);
       },
     });
+    this.playback = new Playback({
+      opts: this.opts, luna: this.luna, log: (l, m) => this.log(l, m),
+      emit: (name, payload) => this.emit(name, payload),
+      sendPlayed: (conn) => this.write(conn, 'played'),
+    });
+    this.pipeline = null;   // a run's pipeline in HA that may still answer: { transcript, text, timer }
     this.server = null;
     this.conns = new Set();
     this.owner = null;      // the connection that ran `run-satellite`
@@ -67,6 +86,7 @@ class Satellite extends EventEmitter {
         this.server.on('error', (e) => this.fail(e));
         this.log('info', 'listening on ' + this.opts.host + ':' + this.port);
         this.mic.start();
+        this.playback.start();
         resolve();
       });
     });
@@ -74,6 +94,8 @@ class Satellite extends EventEmitter {
 
   async stop() {
     this.endRun('stopped', { tell: false });
+    this.disarm();
+    this.playback.stop();
     this.mic.stop();
     for (const c of this.conns) c.sock.destroy();
     if (this.server) {
@@ -98,6 +120,7 @@ class Satellite extends EventEmitter {
     this.stream(run, buffer);
     run.unfollow = this.mic.follow((b) => this.stream(run, b));
     run.timer = setTimeout(() => this.endRun('timeout'), this.opts.maxRunSeconds * 1000);
+    this.arm();
     this.emit('run-start', { bufferMs: Math.round(buffer.length / 32) });
     return { started: true };
   }
@@ -107,6 +130,17 @@ class Satellite extends EventEmitter {
     this.endRun('stopped');
     return true;
   }
+
+  // Silence on the tts sink that ducks the programme, ahead of an answer. Resolves { started: true } or
+  // { started: false, reason }. Opts: maxSeconds (capped by warmUpMaxSeconds), wakeSound (false = none).
+  warmUp(o) { return this.playback.warmUp(o); }
+
+  // Ends the warm-up (opts.done: write the done sound first). Returns false when none was running.
+  stopWarmUp(o) { return this.playback.stopWarmUp(o); }
+
+  // Plays a Buffer or a readable stream of raw audio (opts.format: { rate, width: 2, channels }, default
+  // 44100 Hz mono) on the same sink. Resolves { ok } when it has been heard.
+  play(stream, o) { return this.playback.play(stream, o); }
 
   // Calls fn(Buffer) with the processed microphone audio (S16 LE, 16 kHz, mono) until the returned function is called.
   followMic(fn) { return this.mic.follow(fn); }
@@ -118,10 +152,14 @@ class Satellite extends EventEmitter {
   // Live settings: micChannel, micGainDb, bufferSeconds.
   configure(o) {
     this.mic.configure({ channel: o.micChannel, gainDb: o.micGainDb, bufferSeconds: o.bufferSeconds });
+    if (o.duckLevel !== undefined) this.playback.setDuckLevel(o.duckLevel);
   }
 
   status() {
-    return { listening: !!this.server, connected: !!this.owner, paused: this.paused, running: !!this.run, mic: this.mic.status() };
+    return {
+      listening: !!this.server, connected: !!this.owner, paused: this.paused, running: !!this.run, mic: this.mic.status(),
+      warm: !!this.playback.wake, playing: this.playback.speaking(), duckLevel: this.playback.duckLevel,
+    };
   }
 
   // ---- connections ----
@@ -152,6 +190,8 @@ class Satellite extends EventEmitter {
     this.conns.delete(conn);
     if (this.owner !== conn) return;
     this.endRun('disconnected', { tell: false });
+    this.disarm();
+    this.playback.abortAll('disconnected');
     this.owner = null;
     this.paused = false;
     this.emit('disconnected', { address: conn.address, reason: 'closed' });
@@ -176,18 +216,29 @@ class Satellite extends EventEmitter {
         if (!this.paused) {
           this.paused = true;
           this.endRun('paused', { tell: false });
+          this.disarm();
+          this.playback.abortAll('paused');
           this.emit('paused', {});
         }
         break;
       case 'transcribe': this.emit('stt-start', { language: d.language }); break;
       case 'transcript':
         this.emit('stt-stop', { text: d.text === undefined ? '' : d.text });
+        if (this.pipeline) this.pipeline.transcript = true;
         this.endRun('transcript', { tell: false });
+        this.arm();
         break;
+      case 'synthesize':
+        if (this.pipeline) { this.pipeline.text = d.text === undefined ? '' : d.text; this.pipeline.voice = d.voice; this.arm(); }
+        break;
+      case 'audio-start': this.audioStart(conn, d); break;
+      case 'audio-chunk': this.playback.chunkRx(d, ev.payload); break;
+      case 'audio-stop': this.audioStop(); break;
       case 'voice-started': this.emit('voice-start', d); break;
       case 'voice-stopped': this.emit('voice-stop', d); break;
       case 'error':
         this.endRun('error', { tell: false, error: { text: d.text, code: d.code } });
+        this.disarm();
         break;
       default: break; // unknown or not yet handled events are ignored, as HA does
     }
@@ -198,6 +249,8 @@ class Satellite extends EventEmitter {
       const old = this.owner;
       this.log('info', 'new satellite connection from ' + conn.address + ' replaces the one from ' + old.address);
       this.endRun('disconnected', { tell: false });
+      this.disarm();
+      this.playback.abortAll('replaced');
       this.owner = null;
       old.sock.destroy();
       this.conns.delete(old);
@@ -256,6 +309,66 @@ class Satellite extends EventEmitter {
     const info = { reason };
     if (o.error) info.error = o.error;
     this.emit('run-stop', info);
+    // HA may still answer a run that ended on our side (mic lost, time-out, stopRun): keep waiting a while.
+    if (['timeout', 'mic-lost', 'backpressure', 'stopped'].includes(reason) && this.pipeline) this.arm();
+  }
+
+  // ---- the pipeline in HA behind a run, and the audio HA sends back ----
+
+  // (Re)starts the wait for an answer: while a run streams or HA is working on a transcript, audio that
+  // follows is the answer to it; if nothing comes in answerTimeoutSeconds the pipeline is given up.
+  arm() {
+    if (!this.pipeline) this.pipeline = { transcript: false, text: null, voice: null, timer: null };
+    clearTimeout(this.pipeline.timer);
+    if (this.run) return;   // the run's own limit covers the streaming part
+    const p = this.pipeline;
+    p.timer = setTimeout(() => {
+      if (this.pipeline !== p) return;
+      this.pipeline = null;
+      this.emit('no-answer', { transcript: p.transcript });
+    }, this.opts.answerTimeoutSeconds * 1000);
+  }
+
+  disarm() {
+    if (!this.pipeline) return;
+    clearTimeout(this.pipeline.timer);
+    this.pipeline = null;
+  }
+
+  // Audio from HA outside a run is an announcement; after a transcript (or a synthesize) it is the
+  // answer. Audio while the microphone still streams cannot be an answer: HA cancelled the run for an
+  // announce, and the run ends here.
+  audioStart(conn, d) {
+    const format = { rate: d.rate, width: d.width, channels: d.channels };
+    let kind = 'announce';
+    let cancelled = false;
+    if (this.run) {
+      this.endRun('announce', { tell: false });
+      cancelled = true;
+    } else if (this.pipeline && (this.pipeline.transcript || this.pipeline.text !== null)) {
+      kind = 'tts';
+    } else if (this.pipeline) {
+      cancelled = true;
+    }
+    const p = this.pipeline;
+    if (kind === 'announce' && cancelled) this.disarm();
+    if (kind === 'tts') clearTimeout(p.timer);
+    this.playback.beginRx(conn, kind, format, {
+      cancelled, event: kind === 'tts' ? { text: p.text, voice: p.voice } : {},
+    });
+  }
+
+  audioStop() {
+    const rx = this.playback.rx;
+    if (!rx) return;
+    this.playback.endRx((r) => {
+      if (r.kind === 'tts') {
+        this.disarm();
+        this.playback.stopWarmUp();
+      } else if (r.info.cancelled) {
+        this.playback.stopWarmUp();
+      }
+    });
   }
 
   fail(e) {
