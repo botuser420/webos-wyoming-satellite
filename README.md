@@ -60,6 +60,7 @@ Everything is exported from the package root: `Satellite` (plus `Mic`, `Player`,
 | `allowedHosts` | `[]` | IPs allowed to connect; empty = open, with a warning |
 | `name` | `'webOS TV'` | satellite and device name shown in HA |
 | `area` | `null` | suggested HA area |
+| `startMic` | `true` | open the microphone at `start()`; `false` leaves it closed until `setMic(true)` |
 | `micChannel` | `0` | which of the 5 mic channels (0-4) |
 | `micGainDb` | `15` | gain in dB (-20..40) |
 | `bufferSeconds` | `2` | pre-wake-word buffer kept in memory (0..10 s), sent first by `startRun` |
@@ -99,10 +100,14 @@ Everything is exported from the package root: `Satellite` (plus `Mic`, `Player`,
   `{ on, output, since, restarts, bufferMs }`.
 - `await sat.warmUp({ maxSeconds, wakeSound })` plays silence on `ptts` (ducking), with the wake sound first; resolves
   `{ started: true }` or `{ started: false, reason }` (`tv-off`, `sink-lost`, or the luna error). Calling it again
-  while warm only moves the limit. It works without a run of its own.
+  while warm moves the limit and plays the wake sound again (unless `wakeSound: false`), so a new wake word during the
+  hold still gets its ping. It works without a run of its own.
 - `sat.stopWarmUp({ done })` ends it (with `done: true` the done sound is written first); returns false when none runs.
-- `await sat.play(bufferOrStream, { format })` plays raw s16le audio (`format`: `{ rate, width: 2, channels }`, default
-  44100 Hz mono) and resolves `{ ok }` when it has been heard.
+- `await sat.play(bufferOrStream, { format, signal })` plays raw s16le audio (`format`: `{ rate, width: 2, channels }`, default
+  44100 Hz mono) and resolves `{ ok }` when it has been heard. Abort the optional `signal` (`AbortSignal`) to cancel: that
+  play's queued audio is dropped (other audio is untouched), a stream stops being read, and it resolves
+  `{ ok: false, aborted: true }`. Roughly `playLeadMs` of audio already written to the sink still sounds.
+- `sat.setMic(on)` opens or closes the microphone (a running run ends with `mic-lost`). Use it with `startMic: false`.
 
 ### Events
 

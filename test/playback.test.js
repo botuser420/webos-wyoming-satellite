@@ -335,3 +335,53 @@ test('without duckLevel the tv settings are left alone', async () => {
   assert.equal(mine.filter((x) => JSON.stringify(x.payload).includes('TTSMixingRatio')).length, 0);
   assert.equal(mine.filter((x) => /getForegroundAppInfo/.test(x.uri)).length, 0);
 });
+
+test('warmUp while already warm plays the wake sound again, but not with wakeSound: false', async () => {
+  const sat = await makeSat({ wakeSound: wav(44100, 100, 5000) });
+  await sat.warmUp();
+  await sleep(500);
+  assert.equal(spans(sink.bytes()).length, 1);
+  assert.deepEqual(await sat.warmUp(), { started: true, already: true });
+  await sleep(500);
+  assert.equal(spans(sink.bytes()).length, 2, 'a second ping');
+  await sat.warmUp({ wakeSound: false });
+  await sleep(400);
+  assert.equal(spans(sink.bytes()).length, 2, 'no third ping');
+  assert.equal(sink.starts().length, 1);
+  assert.equal(sat.names().filter((n) => n === 'warm-up-start').length, 1);
+});
+
+test('play() with an AbortSignal stops its own audio, resolves { ok: false, aborted: true } and leaves other audio alone', async () => {
+  const sat = await makeSat();
+  const ac = new AbortController();
+  const long = pcm(44100, 3000, 6000);
+  const p = sat.play(long, { signal: ac.signal });
+  const q = sat.play(pcm(44100, 300, 3000));
+  await sleep(300);
+  ac.abort();
+  assert.deepEqual(await p, { ok: false, aborted: true });
+  assert.deepEqual(await q, { ok: true });
+  await sleep(500);
+  const ms = sink.bytes().length / 88.2;
+  assert.ok(ms < 2000, 'the long sound was cut short, wrote ' + ms + ' ms');
+  assert.equal(sat.status().playing, false);
+});
+
+test('play() with a signal that is already aborted plays nothing; an aborted stream stops being read', async () => {
+  const sat = await makeSat();
+  const ac = new AbortController();
+  ac.abort();
+  assert.deepEqual(await sat.play(pcm(44100, 500, 5000), { signal: ac.signal }), { ok: false, aborted: true });
+  await sleep(300);
+  assert.deepEqual(spans(sink.bytes()), []);
+  const ac2 = new AbortController();
+  let reads = 0;
+  async function* source() { for (;;) { reads++; yield pcm(44100, 100, 5000); await sleep(20); } }
+  const p = sat.play(source(), { signal: ac2.signal });
+  await sleep(200);
+  ac2.abort();
+  assert.deepEqual(await p, { ok: false, aborted: true });
+  const n = reads;
+  await sleep(200);
+  assert.equal(reads, n, 'stream no longer read');
+});

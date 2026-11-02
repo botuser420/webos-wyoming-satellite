@@ -22,6 +22,7 @@ class Satellite extends EventEmitter {
       host: '0.0.0.0',
       allowedHosts: [],
       name: 'webOS TV',
+      startMic: true,
       area: null,
       maxRunSeconds: 15,
       chunkBytes: 2048,
@@ -85,7 +86,7 @@ class Satellite extends EventEmitter {
         this.server.removeListener('error', reject);
         this.server.on('error', (e) => this.fail(e));
         this.log('info', 'listening on ' + this.opts.host + ':' + this.port);
-        this.mic.start();
+        if (this.opts.startMic) this.mic.start();
         this.playback.start();
         resolve();
       });
@@ -139,8 +140,16 @@ class Satellite extends EventEmitter {
   stopWarmUp(o) { return this.playback.stopWarmUp(o); }
 
   // Plays a Buffer or a readable stream of raw audio (opts.format: { rate, width: 2, channels }, default
-  // 44100 Hz mono) on the same sink. Resolves { ok } when it has been heard.
+  // 44100 Hz mono) on the same sink. Resolves { ok } when it has been heard. opts.signal (AbortSignal): aborting drops
+  // this play's queued audio (other audio is untouched), stops reading the stream and resolves { ok: false, aborted: true }.
+  // What is already written to the sink (about playLeadMs) still sounds.
   play(stream, o) { return this.playback.play(stream, o); }
+
+  // Opens (true) or closes (false) the microphone; a running run ends with 'mic-lost'. With startMic: false this is the
+  // only way the mic opens (call it after start()).
+  setMic(on) {
+    if (on) this.mic.start(); else this.mic.stop();
+  }
 
   // Calls fn(Buffer) with the processed microphone audio (S16 LE, 16 kHz, mono) until the returned function is called.
   followMic(fn) { return this.mic.follow(fn); }

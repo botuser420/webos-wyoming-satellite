@@ -122,6 +122,16 @@ class Player {
   // Audio waiting in the queue is dropped (marks call back with false); the sink stays as it is.
   flush() { this.dropQueue(false); }
 
+  // Removes the queued audio and marks with this tag (marks call back with false). Audio already written stays.
+  dropTag(tag) {
+    const keep = [];
+    for (const e of this.queue) {
+      if (e.tag !== tag) keep.push(e);
+      else if (e.mark) { this.pendingMarks--; e.mark(false); }
+    }
+    this.queue = keep;
+  }
+
   setWarm(on) {
     this.warm = !!on;
     if (on) this.open();
@@ -131,15 +141,16 @@ class Player {
   hold() { this.holders++; this.idleSince = null; }
   release() { this.holders = Math.max(0, this.holders - 1); }
 
-  enqueue(buf) {
+  // `tag` (any object) lets dropTag() remove this audio again.
+  enqueue(buf, tag) {
     if (!buf || !buf.length) return;
-    this.queue.push({ buf: buf.length & 1 ? buf.slice(0, buf.length - 1) : buf });   // queued first: a sink that opens now starts with it
+    this.queue.push({ buf: buf.length & 1 ? buf.slice(0, buf.length - 1) : buf, tag });   // queued first: a sink that opens now starts with it
     if (!this.open()) this.dropQueue(false);
   }
 
   // cb(true) when the audio queued so far has been played, cb(false) when it was dropped.
-  mark(cb) {
-    this.queue.push({ mark: cb });
+  mark(cb, tag) {
+    this.queue.push({ mark: cb, tag });
     this.pendingMarks++;
     if (!this.open()) this.dropQueue(false);
   }

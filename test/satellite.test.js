@@ -347,3 +347,29 @@ test('stop() closes connections and the mic', async () => {
   await c.waitClosed();
   assert.equal(sat.micStatus().on, false);
 });
+
+test('startMic: false keeps the mic closed at start; setMic(true/false) opens and closes it', async () => {
+  const before = tv.count('voiceinput/startStreaming');
+  const sat = await makeSat({ startMic: false });
+  await sleep(400);
+  assert.equal(sat.micStatus().on, false);
+  assert.equal(tv.count('voiceinput/startStreaming'), before, 'the mic never opened at boot');
+  sat.setMic(true);
+  await until('mic on', () => sat.micStatus().on);
+  sat.setMic(true);   // twice is harmless
+  sat.setMic(false);
+  await until('mic off', () => !sat.micStatus().on);
+  assert.equal(sat.status().mic.on, false);
+});
+
+test('setMic(false) ends a running run with mic-lost', async () => {
+  const sat = await makeSat();
+  const c = await ha(sat);
+  c.send('run-satellite');
+  await until('mic', () => sat.micStatus().on);
+  await until('connected', () => sat.names().includes('connected'));
+  assert.equal(sat.startRun().started, true);
+  sat.setMic(false);
+  await until('run-stop', () => sat.names().includes('run-stop'));
+  assert.equal(sat.events.find((x) => x.name === 'run-stop').e.reason, 'mic-lost');
+});
