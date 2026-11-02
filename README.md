@@ -204,6 +204,8 @@ The package root exports `Satellite`, an `EventEmitter`. The other modules in `s
   44100 Hz mono) and resolves `{ ok }` when it has been heard. Abort the optional `signal` (`AbortSignal`) to cancel: that
   play's queued audio is dropped (other audio is untouched), a stream stops being read, and it resolves
   `{ ok: false, aborted: true }`. Roughly `playLeadMs` of audio already written to the sink still sounds.
+- `sat.setAllowedHosts(list)` replaces the `allowedHosts` list (IP addresses) at any time, for example after a host name has
+  been resolved; call it before `start()` to avoid the open-port warning.
 - `sat.setMic(on)` opens or closes the microphone (a running run ends with `mic-lost`). Use it with `startMic: false`.
 
 ### Events

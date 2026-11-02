@@ -80,6 +80,11 @@ class Satellite extends EventEmitter {
 
   get port() { return this.server ? this.server.address().port : this.opts.port; }
 
+  // Replaces the list of allowed IP addresses (see `allowedHosts`) while running, for example after resolving a name.
+  setAllowedHosts(list) {
+    this.allowed = new Set((list || []).map(normalizeAddress));
+  }
+
   // Listens, warns about an open port, starts the microphone.
   start() {
     if (this.allowed.size === 0) {
