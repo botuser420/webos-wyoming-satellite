@@ -61,6 +61,7 @@ Everything is exported from the package root: `Satellite` (plus `Mic`, `Player`,
 | `name` | `'webOS TV'` | satellite and device name shown in HA |
 | `area` | `null` | suggested HA area |
 | `startMic` | `true` | open the microphone at `start()`; `false` leaves it closed until `setMic(true)` |
+| `alwaysListen` | `false` | stream the mic continuously and let Home Assistant run the wake word (see below); `startRun` is then not available |
 | `micChannel` | `0` | which of the 5 mic channels (0-4) |
 | `micGainDb` | `15` | gain in dB (-20..40) |
 | `bufferSeconds` | `2` | pre-wake-word buffer kept in memory (0..10 s), sent first by `startRun` |
@@ -96,7 +97,7 @@ Everything is exported from the package root: `Satellite` (plus `Mic`, `Player`,
   stop. Several followers get the same audio (for other mic users next to the satellite).
 - `sat.configure({ micChannel, micGainDb, bufferSeconds, duckLevel })` changes these settings while running;
   out-of-range values keep the old one. `sat.clearMic()` empties the buffer.
-- `sat.status()` is `{ listening, connected, paused, running, mic, warm, playing, duckLevel }`; `sat.micStatus()` is
+- `sat.status()` is `{ listening, wakeStream, connected, paused, running, mic, warm, playing, duckLevel }`; `sat.micStatus()` is
   `{ on, output, since, restarts, bufferMs }`.
 - `await sat.warmUp({ maxSeconds, wakeSound })` plays silence on `ptts` (ducking), with the wake sound first; resolves
   `{ started: true }` or `{ started: false, reason }` (`tv-off`, `sink-lost`, or the luna error). Calling it again
@@ -155,6 +156,15 @@ ducked and keeps an ARC path to a sound bar from dropping out.
 - A warm-up ends on `stopWarmUp()`, on its maximum, when the answer or a cancelling announcement has been played,
   or when the sink is lost. A run whose answer never comes (for example when another satellite won) gets a
   `no-answer` event after `answerTimeoutSeconds`; the warm-up is then up to the host (`stopWarmUp()`) or its maximum.
+
+## Wake word in Home Assistant (`alwaysListen`)
+
+With `alwaysListen: true` the satellite sends `run-pipeline` from the `wake` stage with `restart_on_end` and streams the
+microphone continuously once Home Assistant has taken the connection, the mic is on and the satellite is not muted.
+Home Assistant runs the wake word (openWakeWord) on that stream. A `detection` from Home Assistant emits `wake`
+({ name }) and starts the warm-up (ducking and wake sound); the answer then plays as usual and ends the warm-up. After
+an `error` (for example no speech recognised) the warm-up ends and the satellite asks for a new pipeline. The stream
+stops while muted or when the mic is lost, and restarts by itself.
 
 ## How it behaves towards Home Assistant
 
