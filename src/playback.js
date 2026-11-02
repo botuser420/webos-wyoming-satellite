@@ -44,6 +44,7 @@ class Playback {
   }
 
   start() {
+    this.stopped = false;
     const o = this.host.opts;
     this.wakeSound = loadSound('wakeSound', o.wakeSound, this.log);
     this.doneSound = loadSound('doneSound', o.doneSound, this.log);
@@ -56,6 +57,7 @@ class Playback {
   }
 
   stop() {
+    this.stopped = true;
     this.endWarm('stopped', false);
     this.abortRx('stopped');
     if (this.guard) this.guard.stop();
@@ -74,7 +76,7 @@ class Playback {
     this.duckSetting = true;
     duck.setGlobal(this.host.luna, level, (err, value) => {
       this.duckSetting = false;
-      if (value !== undefined && value !== null) { this.duckLevel = value; this.guard.start(); }
+      if (value !== undefined && value !== null) { this.duckLevel = value; if (!this.stopped) this.guard.start(); }
       if (err) this.log('warn', 'duck level: ' + err.message);
       cb(err);
     });
