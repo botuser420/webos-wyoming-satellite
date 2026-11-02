@@ -385,3 +385,43 @@ test('play() with a signal that is already aborted plays nothing; an aborted str
   await sleep(200);
   assert.equal(reads, n, 'stream no longer read');
 });
+
+test('an announce after a transcript without synthesize is an announce, not the answer', async () => {
+  const sat = await makeSat({ answerTimeoutSeconds: 3 });
+  const c = await ha(sat);
+  await until('mic', () => sat.micStatus().on);
+  sat.startRun();
+  c.send('transcript', { text: 'x' });
+  await sleep(50);
+  sendAudio(c, pcm(22050, 200, 3000));          // HA cancelled the pipeline for an announce
+  await c.waitFor('played');
+  assert.equal(sat.event('played').e.kind, 'announce');
+  assert.ok(sat.event('announce-start'));
+  assert.equal(sat.event('tts-start'), undefined);
+  assert.equal(sat.event('no-answer'), undefined, 'the cancelled pipeline is given up');
+});
+
+test('streamed answer audio that arrives just before synthesize is still the answer', async () => {
+  const sat = await makeSat({ answerTimeoutSeconds: 3 });
+  const c = await ha(sat);
+  await until('mic', () => sat.micStatus().on);
+  sat.startRun();
+  c.send('transcript', { text: 'x' });
+  await sleep(50);
+  c.send('audio-start', { rate: 22050, width: 2, channels: 1, timestamp: 0 });
+  await sleep(60);
+  c.send('synthesize', { text: 'hi', voice: {} });
+  c.send('audio-chunk', { rate: 22050, width: 2, channels: 1, timestamp: 0 }, pcm(22050, 100, 3000));
+  c.send('audio-stop', { timestamp: 0 });
+  await c.waitFor('played');
+  assert.equal(sat.event('played').e.kind, 'tts');
+  assert.ok(sat.event('tts-start'));
+  assert.equal(sat.event('announce-start'), undefined);
+});
+
+test('micAwake reports the power state seen by the mic without reaching into the mic', async () => {
+  const sat = await makeSat();
+  await until('awake', () => sat.micAwake() === true);
+  tv.setState({ power: 'Active Standby' });
+  await until('asleep', () => sat.micAwake() === false);
+});

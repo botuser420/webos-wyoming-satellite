@@ -73,6 +73,7 @@ class Satellite extends EventEmitter {
     this.conns = new Set();
     this.owner = null;      // the connection that ran `run-satellite`
     this.paused = false;
+    this.hold = null;       // audio-start waiting to be told apart as answer or announce: { conn, d, events, timer }
     this.run = null;        // { conn, unfollow, timer, pending, sent }
     this.listening = null;  // alwaysListen: { conn, unfollow, pending, sentBytes }, the continuous stream for the wake word in HA
   }
@@ -104,6 +105,7 @@ class Satellite extends EventEmitter {
     this.endRun('stopped', { tell: false });
     this.endListening('stopped');
     this.disarm();
+    this.dropHold();
     this.playback.stop();
     this.mic.stop();
     for (const c of this.conns) c.sock.destroy();
@@ -161,6 +163,9 @@ class Satellite extends EventEmitter {
 
   micStatus() { return this.mic.status(); }
 
+  // true / false: the TV is awake (the mic may run) by the last power poll; null when unknown.
+  micAwake() { return this.mic.awake(); }
+
   // Live settings: micChannel, micGainDb, bufferSeconds.
   configure(o) {
     this.mic.configure({ channel: o.micChannel, gainDb: o.micGainDb, bufferSeconds: o.bufferSeconds });
@@ -204,6 +209,7 @@ class Satellite extends EventEmitter {
     this.endRun(runReason, { tell: false });
     this.endListening(reason, { tell });
     this.disarm();
+    this.dropHold();
     this.playback.abortAll(reason);
   }
 
@@ -251,10 +257,11 @@ class Satellite extends EventEmitter {
         break;
       case 'synthesize':
         if (this.pipeline) { this.pipeline.text = d.text === undefined ? '' : d.text; this.pipeline.voice = d.voice; this.arm(); }
+        if (this.hold) this.resolveHold();
         break;
       case 'audio-start': this.audioStart(conn, d); break;
-      case 'audio-chunk': this.playback.chunkRx(d, ev.payload); break;
-      case 'audio-stop': this.audioStop(); break;
+      case 'audio-chunk': if (this.hold) this.hold.events.push(ev); else this.playback.chunkRx(d, ev.payload); break;
+      case 'audio-stop': if (this.hold) this.hold.events.push(ev); else this.audioStop(); break;
       case 'voice-started': this.emit('voice-start', d); break;
       case 'voice-stopped': this.emit('voice-stop', d); break;
       case 'error':
@@ -405,17 +412,45 @@ class Satellite extends EventEmitter {
     this.pipeline = null;
   }
 
-  // Audio from HA outside a run is an announcement; after a transcript (or a synthesize) it is the
-  // answer. Audio while the microphone still streams cannot be an answer: HA cancelled the run for an
-  // announce, and the run ends here.
+  // Audio from HA outside a run is an announcement; after a `synthesize` it is the answer. Audio while the
+  // microphone still streams cannot be an answer: HA cancelled the run for an announce, and the run ends here.
+  // Audio after a transcript but before any `synthesize` is either a streamed answer (HA sends `synthesize` a
+  // moment later) or an announce that cancelled the pipeline (nothing follows): it is held for CLASSIFY_MS.
   audioStart(conn, d) {
+    const p = this.pipeline;
+    if (!this.run && p && p.transcript && p.text === null) {
+      this.dropHold();
+      this.hold = { conn, d, events: [], timer: setTimeout(() => this.resolveHold(), CLASSIFY_MS) };
+      return;
+    }
+    this.beginAudio(conn, d);
+  }
+
+  resolveHold() {
+    const h = this.hold;
+    if (!h) return;
+    clearTimeout(h.timer);
+    this.hold = null;
+    this.beginAudio(h.conn, h.d);
+    for (const ev of h.events) {
+      if (ev.type === 'audio-chunk') this.playback.chunkRx(ev.data || {}, ev.payload); else this.audioStop();
+    }
+  }
+
+  dropHold() {
+    if (!this.hold) return;
+    clearTimeout(this.hold.timer);
+    this.hold = null;
+  }
+
+  beginAudio(conn, d) {
     const format = { rate: d.rate, width: d.width, channels: d.channels };
     let kind = 'announce';
     let cancelled = false;
     if (this.run) {
       this.endRun('announce', { tell: false });
       cancelled = true;
-    } else if (this.pipeline && (this.pipeline.transcript || this.pipeline.text !== null)) {
+    } else if (this.pipeline && this.pipeline.text !== null) {
       kind = 'tts';
     } else if (this.pipeline) {
       cancelled = true;
