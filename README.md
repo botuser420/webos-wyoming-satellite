@@ -73,7 +73,9 @@ relative to the configuration file. Everything is optional; the values below are
 
 - `allowedHosts`: IP addresses (not host names) allowed to connect. **Set it.** See Security below: empty means open
   and the service logs a warning at start.
-- `alwaysListen`: `true` (default) streams the mic for the wake word in Home Assistant; see below.
+- `alwaysListen`: `true` (the default of the config file; the library option defaults to `false`) streams the mic
+  continuously to Home Assistant, which runs the wake word. **Privacy:** while it is on, everything the TV microphone
+  hears is sent to your Home Assistant, not only after a wake word. Set it to `false` to avoid that. See below.
 - `mic`: which of the 5 mic channels (0-4), gain in dB (-20..40), and the pre-wake-word buffer in seconds.
 - `sounds`: WAV files (16-bit PCM, any rate) for the wake and the done sound.
 - `duckLevel`: percent (0-100) the programme is turned down to while the satellite plays; `null` leaves the TV
@@ -142,8 +144,7 @@ event `refused`). **An empty list lets every device on the network in** and logs
 
 ## API
 
-Everything is exported from the package root: `Satellite` (plus `Mic`, `Player`, `createLuna`, `wyoming`,
-`pcm`, `duck` for building blocks and tests). `Satellite` is an `EventEmitter`.
+The package root exports `Satellite`, an `EventEmitter`. The other modules in `src/` are internal.
 
 ### Options (`new Satellite(options)`)
 
@@ -155,7 +156,7 @@ Everything is exported from the package root: `Satellite` (plus `Mic`, `Player`,
 | `name` | `'webOS TV'` | satellite and device name shown in HA |
 | `area` | `null` | suggested HA area |
 | `startMic` | `true` | open the microphone at `start()`; `false` leaves it closed until `setMic(true)` |
-| `alwaysListen` | `false` | stream the mic continuously and let Home Assistant run the wake word (see below); `startRun` is then not available |
+| `alwaysListen` | `false` | library default `false` (the standalone config file defaults to `true`). Stream the mic continuously to Home Assistant and let it run the wake word (see below; privacy note there); `startRun` is then not available |
 | `micChannel` | `0` | which of the 5 mic channels (0-4) |
 | `micGainDb` | `15` | gain in dB (-20..40) |
 | `bufferSeconds` | `2` | pre-wake-word buffer kept in memory (0..10 s), sent first by `startRun` |
@@ -192,7 +193,8 @@ Everything is exported from the package root: `Satellite` (plus `Mic`, `Player`,
 - `sat.configure({ micChannel, micGainDb, bufferSeconds, duckLevel })` changes these settings while running;
   out-of-range values keep the old one. `sat.clearMic()` empties the buffer.
 - `sat.status()` is `{ listening, wakeStream, connected, paused, running, mic, warm, playing, duckLevel }`; `sat.micStatus()` is
-  `{ on, output, since, restarts, bufferMs }`.
+  `{ on, output, since, restarts, bufferMs }`; `sat.micAwake()` is `true` or `false` by the last power poll
+  (`null` when unknown).
 - `await sat.warmUp({ maxSeconds, wakeSound })` plays silence on `ptts` (ducking), with the wake sound first; resolves
   `{ started: true }` or `{ started: false, reason }` (`tv-off`, `sink-lost`, or the luna error). Calling it again
   while warm moves the limit and plays the wake sound again (unless `wakeSound: false`), so a new wake word during the
@@ -252,6 +254,9 @@ ducked and keeps an ARC path to a sound bar from dropping out.
   `no-answer` event after `answerTimeoutSeconds`; the warm-up is then up to the host (`stopWarmUp()`) or its maximum.
 
 ## Wake word in Home Assistant (`alwaysListen`)
+
+**Privacy:** with `alwaysListen` the microphone audio is streamed to Home Assistant all the time the conditions below
+hold, not only after a wake word. Use it only with a Home Assistant you trust, on a network you trust.
 
 With `alwaysListen: true` the satellite sends `run-pipeline` from the `wake` stage with `restart_on_end` and streams the
 microphone continuously once Home Assistant has taken the connection, the mic is on and the satellite is not muted.
