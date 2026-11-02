@@ -2,10 +2,10 @@
 
 A [Wyoming](https://github.com/OHF-Voice/wyoming) satellite for rooted LG webOS TVs. Home Assistant
 connects to the TV and sees an `assist_satellite`, fed by the TV's own microphone (`internal1`).
-It is a Node library (and, in later releases, a standalone service).
+It is a standalone service (configured by one JSON file) and a Node library.
 
-Status: early. This version provides the Wyoming server, the microphone, and playing answers and
-announcements on the TV with ducking of the running programme.
+Status: 0.1.0. It provides the Wyoming server, the microphone, a continuous stream for a wake word detected in
+Home Assistant, and playing answers and announcements on the TV with ducking of the running programme.
 
 ## Requirements
 
@@ -15,7 +15,101 @@ announcements on the TV with ducking of the running programme.
 - Home Assistant with the Wyoming integration (add the TV by host and port). For a wake word in
   Home Assistant, run openWakeWord there; this library does not detect wake words itself.
 
-## Install and use
+## Install the service on the TV
+
+You need a rooted LG webOS TV with SSH access. Node is already on the TV (check with `node --version`, 20.12 or newer);
+there is no npm and no git on it, and the satellite needs neither.
+
+1. **Copy the files.** From a computer with this repository (or an unpacked release), copy `bin/`, `src/`,
+   `init/`, `package.json` and a configuration file to a directory on the TV that survives reboots. `/media/developer` is a writable, persistent
+   location on rooted TVs:
+
+   ```
+   ssh root@<tv> mkdir -p /media/developer/webos-wyoming-satellite
+   scp -r bin src init package.json root@<tv>:/media/developer/webos-wyoming-satellite/
+   scp config.example.json root@<tv>:/media/developer/webos-wyoming-satellite/config.json
+   ```
+
+2. **Edit `config.json`** on the TV (below). At least set `allowedHosts` to the address of Home Assistant.
+3. **Check it:** `node bin/webos-wyoming-satellite.js --check --config config.json` prints `config ok` or lists every
+   problem and exits with code 2.
+4. **Run it once by hand:** `node bin/webos-wyoming-satellite.js --config config.json`. It logs `listening on ...`.
+   Stop it with Ctrl+C.
+5. **Start it at boot.** The script `init/webos-wyoming-satellite.sh` starts the service, keeps it running (it is
+   started again 5 s after it ends, except after a rejected configuration) and takes `start`, `stop`, `restart` and `status`.
+   Rooted TVs run executable scripts from an init.d-style directory at boot; with the Homebrew Channel root tooling
+   that is `/var/lib/webosbrew/init.d/`:
+
+   ```
+   ssh root@<tv> 'cp /media/developer/webos-wyoming-satellite/init/webos-wyoming-satellite.sh /var/lib/webosbrew/init.d/50-webos-wyoming-satellite && chmod +x /var/lib/webosbrew/init.d/50-webos-wyoming-satellite'
+   ssh root@<tv> /var/lib/webosbrew/init.d/50-webos-wyoming-satellite start
+   ```
+
+   The script reads `WWS_DIR` (default `/media/developer/webos-wyoming-satellite`), `WWS_CONFIG`, `WWS_NODE`, `WWS_LOG`
+   (default `satellite.log` next to the code, rotated at 256 kB) and `WWS_RUN`; its header explains each. If your
+   TV uses another boot mechanism, run `webos-wyoming-satellite.sh start` from it. To stop the service while
+   testing: `... webos-wyoming-satellite.sh stop`.
+
+### The configuration file
+
+One JSON object. Unknown settings are errors, and all problems are reported together. Relative sound paths are
+relative to the configuration file. Everything is optional; the values below are the defaults unless noted.
+
+```json
+{
+  "port": 10700,
+  "host": "0.0.0.0",
+  "name": "webOS TV",
+  "area": null,
+  "allowedHosts": [],
+  "alwaysListen": true,
+  "mic": { "channel": 0, "gainDb": 15, "bufferSeconds": 2 },
+  "sounds": { "wake": null, "done": null },
+  "duckLevel": null,
+  "logLevel": "info",
+  "advanced": {}
+}
+```
+
+- `allowedHosts`: IP addresses (not host names) allowed to connect. **Set it.** See Security below: empty means open
+  and the service logs a warning at start.
+- `alwaysListen`: `true` (default) streams the mic for the wake word in Home Assistant; see below.
+- `mic`: which of the 5 mic channels (0-4), gain in dB (-20..40), and the pre-wake-word buffer in seconds.
+- `sounds`: WAV files (16-bit PCM, any rate) for the wake and the done sound.
+- `duckLevel`: percent (0-100) the programme is turned down to while the satellite plays; `null` leaves the TV
+  settings alone.
+- `logLevel`: `info`, `warn` or `error`. The service logs to stderr; the boot script writes that to its log file.
+- `advanced`: any of the numeric tuning options of the library table below (`holdMs`, `maxRunSeconds`,
+  `warmUpMaxSeconds`, `answerTimeoutSeconds`, `maxQueueSeconds`, `playLeadMs`, `micPollMs`, `micRestartMs`,
+  `micKeepAliveMs`, `chunkBytes`, `wakeSoundMaxDelayMs`, the `duck*Ms` timings), `duckApps`, and the strings `pacat`,
+  `lunaSend`, `sink`.
+
+### Add the TV to Home Assistant
+
+1. In Home Assistant: Settings, Devices & services, Add integration, **Wyoming Protocol**.
+2. Enter the IP address of the TV and the `port` (10700 by default). Home Assistant creates a device with an
+   `assist_satellite` entity named after `name` (and the area, if `area` is set).
+3. Set the pipeline of the satellite on its device page (the "Assistant" select).
+
+Make sure the address of Home Assistant is in `allowedHosts`. Home Assistant opens several connections (a short probe
+about every 30 seconds and one long-lived satellite connection); all come from the same address.
+
+### Run the wake word in Home Assistant
+
+The satellite does not detect wake words itself. With `alwaysListen: true` it streams the TV microphone to Home
+Assistant, which runs the wake word:
+
+1. Install the **openWakeWord** add-on (Settings, Add-ons) and start it; Home Assistant discovers it through the
+   Wyoming integration.
+2. In Settings, Voice assistants, open the assistant you use for the TV and choose a wake word (for example "ok nabu")
+   next to its speech-to-text and text-to-speech.
+3. Say the wake word near the TV. The programme is turned down (`duckLevel`), the wake sound plays if configured, and
+   the answer is spoken on the TV. `assist_satellite.announce` plays announcements the same way.
+
+The audio stream is continuous while the TV is on and Home Assistant has the satellite unmuted. It goes to Home
+Assistant on your network only. The microphone is closed while the TV is off.
+
+## Use as a library
 
 Copy the directory to the TV (or add it as a git submodule) and:
 
