@@ -8,6 +8,8 @@
  * running like the real ones. A stream writes 5 channels of S16 at 16 kHz, channel c constantly
  * (c + 1) * 1000, 3200 bytes per 20 ms.
  *
+ * Settings model: glob (global TTSMixingRatio, a string or null), apps (own per-app values), fg (foreground app id);
+ * deleteSystemSettings clears the global and every per-app value, as the real service does.
  * State keys: power, output, stopGen (bumped by stopStreaming), die (running streams exit),
  * timeoutMs (a stream ends this long after start / the last restartTimer), lastRestart.
  */
@@ -30,7 +32,7 @@ function createFakeTv(initial) {
     ? fs.readFileSync(logFile, 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l)) : []);
   const count = (name) => calls().filter((c) => c.uri.endsWith(name)).length;
 
-  fs.writeFileSync(stateFile, JSON.stringify(Object.assign({ power: 'Active', output: 'tv_speaker', stopGen: 0 }, initial)));
+  fs.writeFileSync(stateFile, JSON.stringify(Object.assign({ power: 'Active', output: 'tv_speaker', stopGen: 0, glob: null, apps: {}, fg: 'com.webos.app.home' }, initial)));
   fs.writeFileSync(lunaSend, `#!/usr/bin/env node
 const fs = require('fs'), net = require('net');
 const dir = ${JSON.stringify(dir)};
@@ -74,6 +76,19 @@ else if (uri.endsWith('voiceinput/getDevices')) {
 } else if (uri.endsWith('voiceinput/stopStreaming')) {
   const n = read(); n.stopGen = (n.stopGen || 0) + 1; write(n);
   out({ returnValue: true, id: 'internal1', state: 'voice stop' });
+} else if (uri.endsWith('getSystemSettings')) {
+  const v = payload.app_id && payload.app_id in s.apps ? s.apps[payload.app_id] : s.glob;
+  if (v === null || v === undefined) out({ returnValue: false, errorText: 'There is no matched result from DB' });
+  else out({ returnValue: true, category: 'sound', settings: { TTSMixingRatio: v } });
+} else if (uri.endsWith('setSystemSettings')) {
+  if (payload.app_id) s.apps[payload.app_id] = payload.settings.TTSMixingRatio; else s.glob = payload.settings.TTSMixingRatio;
+  write(s); out({ returnValue: true });
+} else if (uri.endsWith('deleteSystemSettings')) {
+  s.glob = null; s.apps = {}; write(s); out({ returnValue: true });
+} else if (uri.endsWith('getForegroundAppInfo')) {
+  let last = s.fg;
+  out({ returnValue: true, subscribed: true, appId: last });
+  setInterval(() => { const n = read().fg; if (n !== last) { last = n; out({ returnValue: true, subscribed: true, appId: n }); } }, 30);
 } else out({ returnValue: false, errorText: 'unknown ' + uri });
 `, { mode: 0o755 });
 
