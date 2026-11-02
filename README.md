@@ -4,8 +4,8 @@ A [Wyoming](https://github.com/OHF-Voice/wyoming) satellite for rooted LG webOS 
 connects to the TV and sees an `assist_satellite`, fed by the TV's own microphone (`internal1`).
 It is a Node library (and, in later releases, a standalone service).
 
-Status: early. This version provides the Wyoming server and the microphone. Playing answers and
-announcements on the TV (ticket "playback") is not in it yet.
+Status: early. This version provides the Wyoming server, the microphone, and playing answers and
+announcements on the TV with ducking of the running programme.
 
 ## Requirements
 
@@ -48,8 +48,8 @@ event `refused`). **An empty list lets every device on the network in** and logs
 
 ## API
 
-Everything is exported from the package root: `Satellite` (plus `Mic`, `createLuna`, `wyoming`
-for building blocks and tests). `Satellite` is an `EventEmitter`.
+Everything is exported from the package root: `Satellite` (plus `Mic`, `Player`, `createLuna`, `wyoming`,
+`pcm`, `duck` for building blocks and tests). `Satellite` is an `EventEmitter`.
 
 ### Options (`new Satellite(options)`)
 
@@ -70,8 +70,19 @@ for building blocks and tests). `Satellite` is an `EventEmitter`.
 | `chunkBytes` | `2048` | size of the `audio-chunk` payloads sent to HA |
 | `lunaSend` | `/usr/bin/luna-send` | path of `luna-send` (tests point this at a fake) |
 | `log` | stderr | `log(level, message)`, level `info`, `warn` or `error` |
-
-Reserved for the playback ticket (not implemented yet): wake and end sounds, duck level, warm-up limits.
+| `wakeSound` | `null` | WAV file (path or Buffer, 16-bit PCM, any rate) written into the stream at the start of a warm-up |
+| `doneSound` | `null` | WAV file written into the stream by `stopWarmUp({ done: true })` |
+| `wakeSoundMaxDelayMs` | `500` | no wake sound when the warm-up starts later than this after the `warmUp()` call (a late sound lands in the command) |
+| `duckLevel` | `null` | percent (0-100) the foreground app is turned down to while anything plays; `null` = do not touch the tv settings |
+| `duckApps` | `[]` | app ids whose own ducking value is checked by the duck guard (the foreground app is always checked) |
+| `warmUpMaxSeconds` | `15` | longest warm-up; a call's `maxSeconds` can only shorten it |
+| `answerTimeoutSeconds` | `10` | how long after a run (or its transcript) audio from Home Assistant still counts as its answer |
+| `holdMs` | `350` | the sink stays open this long after the last sound or warm-up, so the programme does not jump back before the receiver is ready |
+| `maxQueueSeconds` | `120` | audio from Home Assistant queued further ahead than this is dropped |
+| `pacat` | `/usr/bin/pacat` | path of `pacat` (tests point this at a fake) |
+| `sink` | `ptts` | PulseAudio sink for voice |
+| `playLeadMs` | `120` | how far ahead of the play clock audio is written; sounds start at most this late |
+| `duckPollMs`, `duckAfterMs`, `duckWaitMs`, `duckMinMs` | `60000`, `3000`, `1000`, `10000` | duck guard timing: periodic check, check after a foreground change, retry while audio plays, minimum gap between warm-up checks |
 
 ### Commands
 
@@ -82,11 +93,16 @@ Reserved for the playback ticket (not implemented yet): wake and end sounds, duc
 - `sat.stopRun()` ends the audio (sends `audio-stop`); returns false when no run is active.
 - `sat.followMic(fn)` calls `fn(Buffer)` for every processed mic chunk and returns a function to
   stop. Several followers get the same audio (for other mic users next to the satellite).
-- `sat.configure({ micChannel, micGainDb, bufferSeconds })` changes mic settings while running;
+- `sat.configure({ micChannel, micGainDb, bufferSeconds, duckLevel })` changes these settings while running;
   out-of-range values keep the old one. `sat.clearMic()` empties the buffer.
-- `sat.status()` is `{ listening, connected, paused, running, mic }`; `sat.micStatus()` is
+- `sat.status()` is `{ listening, connected, paused, running, mic, warm, playing, duckLevel }`; `sat.micStatus()` is
   `{ on, output, since, restarts, bufferMs }`.
-- Planned for the playback ticket: `warmUp`, `stopWarmUp`, `play(stream)`, announce handling.
+- `await sat.warmUp({ maxSeconds, wakeSound })` plays silence on `ptts` (ducking), with the wake sound first; resolves
+  `{ started: true }` or `{ started: false, reason }` (`tv-off`, `sink-lost`, or the luna error). Calling it again
+  while warm only moves the limit. It works without a run of its own.
+- `sat.stopWarmUp({ done })` ends it (with `done: true` the done sound is written first); returns false when none runs.
+- `await sat.play(bufferOrStream, { format })` plays raw s16le audio (`format`: `{ rate, width: 2, channels }`, default
+  44100 Hz mono) and resolves `{ ok }` when it has been heard.
 
 ### Events
 
@@ -96,15 +112,44 @@ Reserved for the playback ticket (not implemented yet): wake and end sounds, duc
 | `disconnected` | `{ address, reason }` | it closed, or a newer connection replaced it (`replaced`) |
 | `paused` / `resumed` | | HA muted (`pause-satellite`) / unmuted the satellite |
 | `run-start` | `{ bufferMs }` | `startRun` began streaming |
-| `run-stop` | `{ reason, error? }` | `transcript`, `error`, `paused`, `disconnected`, `mic-lost`, `timeout`, `backpressure`, `stopped` |
+| `run-stop` | `{ reason, error? }` | `transcript`, `error`, `paused`, `disconnected`, `mic-lost`, `timeout`, `backpressure`, `stopped`, `announce` |
 | `stt-start` / `stt-stop` | `{ language }` / `{ text }` | HA started / finished speech to text |
 | `voice-start` / `voice-stop` | `{ timestamp }` | HA's speech detection heard speech start / end |
 | `mic-status` | `{ on, output, since, restarts, bufferMs }` | the mic stream went on or off (output change, TV on/off, lost stream) |
 | `refused` | `{ address }` | a connection outside `allowedHosts` |
 | `warning` | `{ message }` | empty `allowedHosts` |
 | `error` | `Error` | server error (only emitted when someone listens) |
+| `warm-up-start` | `{ maxSeconds }` | the warm-up plays |
+| `warm-up-stop` | `{ reason }` | `stopped`, `timeout` or `sink-lost` |
+| `tts-start` | `{ text, voice }` | the audio of an answer begins to arrive |
+| `tts-end` | | Home Assistant has sent all of the answer (it may still be playing) |
+| `announce-start` | | an announcement begins to arrive |
+| `played` | `{ kind, ok }` | the answer (`tts`) or announcement was heard and `played` went to Home Assistant; `ok` is false when the sink failed |
+| `announce-end` | `{ ok }` | the announcement was heard (together with `played`) |
+| `no-answer` | `{ transcript }` | no audio came for the run in `answerTimeoutSeconds` |
+| `sink-lost` | `{ reason }` | `pacat` ended or failed |
 
-Reserved for the playback ticket: `tts-start`, `tts-end`, `played`, `announce-start`, `announce-end`.
+## Sound and ducking
+
+One `pacat` process on the `ptts` sink carries everything that is played: the warm-up silence, the wake sound, the
+answer, the done sound, announcements and `play()` audio. It opens at the start of a warm-up (or at the first
+sound) and closes `holdMs` after the last one, so the sink never goes idle in between. That keeps the programme
+ducked and keeps an ARC path to a sound bar from dropping out.
+
+- The silence is paced in Node. Piping `/dev/zero` into `pacat` would let it read ahead about 0.7 s, which delays
+  the sounds written after it.
+- Home Assistant sends audio (usually 22050 Hz, 16-bit mono) faster than real time. It is queued, converted to
+  44100 Hz mono and played at its own pace; `played` goes back when the end has been heard.
+- Ducking is only the system setting `TTSMixingRatio` (`duckLevel`): the tv lowers the foreground app by that
+  percentage while `ptts` plays. At `start()` the global value is set and every per-app value cleared; the duck
+  guard then checks the foreground app (and `duckApps`) and writes the level back for an app that has its own,
+  deviating value. The library never changes the volume of the tv or the receiver (no `setVolume` call anywhere).
+- Audio from Home Assistant is an answer when it follows a transcript or `synthesize` of a run started by
+  `startRun()`; otherwise it is an announcement (`assist_satellite.announce`). An announcement that arrives while
+  a run is still streaming cancels that run (`run-stop` with reason `announce`, no `audio-stop`).
+- A warm-up ends on `stopWarmUp()`, on its maximum, when the answer or a cancelling announcement has been played,
+  or when the sink is lost. A run whose answer never comes (for example when another satellite won) gets a
+  `no-answer` event after `answerTimeoutSeconds`; the warm-up is then up to the host (`stopWarmUp()`) or its maximum.
 
 ## How it behaves towards Home Assistant
 
@@ -128,8 +173,9 @@ device list changes, when the stream is lost, and keeps the stream alive with `r
 npm test            # node --test test/*.test.js
 ```
 
-No TV needed: the tests run a fake Home Assistant client over a real TCP socket and a fake
-`luna-send` executable with a small TV model (power state, sound output, voice-input streams).
+No TV needed: the tests run a fake Home Assistant client over a real TCP socket, a fake
+`luna-send` executable with a small TV model (power state, sound output, voice-input streams, the
+`TTSMixingRatio` setting, the foreground app) and a fake `pacat` that records what is played and when.
 
 ## License
 
