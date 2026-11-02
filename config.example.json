@@ -1,0 +1,10 @@
+{
+  "port": 10700,
+  "name": "Living room TV",
+  "allowedHosts": ["192.0.2.10"],
+  "alwaysListen": true,
+  "mic": { "channel": 0, "gainDb": 15, "bufferSeconds": 2 },
+  "sounds": { "wake": null, "done": null },
+  "duckLevel": 70,
+  "logLevel": "info"
+}

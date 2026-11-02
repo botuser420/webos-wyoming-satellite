@@ -22,6 +22,8 @@ class Satellite extends EventEmitter {
       host: '0.0.0.0',
       allowedHosts: [],
       name: 'webOS TV',
+      startMic: true,
+      alwaysListen: false,
       area: null,
       maxRunSeconds: 15,
       chunkBytes: 2048,
@@ -52,7 +54,7 @@ class Satellite extends EventEmitter {
       restartMs: opts.micRestartMs,
       keepAliveMs: opts.micKeepAliveMs,
       onChange: (s) => {
-        if (!s.on) this.endRun('mic-lost', { tell: false });
+        if (!s.on) { this.endRun('mic-lost', { tell: false }); this.endListening('mic-lost'); } else this.maybeListen();
         this.emit('mic-status', s);
       },
     });
@@ -67,6 +69,7 @@ class Satellite extends EventEmitter {
     this.owner = null;      // the connection that ran `run-satellite`
     this.paused = false;
     this.run = null;        // { conn, unfollow, timer, pending, sent }
+    this.listening = null;  // alwaysListen: { conn, unfollow, pending, sentBytes }, the continuous stream for the wake word in HA
   }
 
   get port() { return this.server ? this.server.address().port : this.opts.port; }
@@ -85,7 +88,7 @@ class Satellite extends EventEmitter {
         this.server.removeListener('error', reject);
         this.server.on('error', (e) => this.fail(e));
         this.log('info', 'listening on ' + this.opts.host + ':' + this.port);
-        this.mic.start();
+        if (this.opts.startMic) this.mic.start();
         this.playback.start();
         resolve();
       });
@@ -94,6 +97,7 @@ class Satellite extends EventEmitter {
 
   async stop() {
     this.endRun('stopped', { tell: false });
+    this.endListening('stopped');
     this.disarm();
     this.playback.stop();
     this.mic.stop();
@@ -110,7 +114,7 @@ class Satellite extends EventEmitter {
   startRun() {
     if (!this.owner) return { started: false, reason: 'not-connected' };
     if (this.paused) return { started: false, reason: 'paused' };
-    if (this.run) return { started: false, reason: 'run-active' };
+    if (this.run || this.listening) return { started: false, reason: 'run-active' };
     if (!this.mic.status().on) return { started: false, reason: 'mic-off' };
     const conn = this.owner;
     const buffer = this.mic.take();
@@ -139,8 +143,16 @@ class Satellite extends EventEmitter {
   stopWarmUp(o) { return this.playback.stopWarmUp(o); }
 
   // Plays a Buffer or a readable stream of raw audio (opts.format: { rate, width: 2, channels }, default
-  // 44100 Hz mono) on the same sink. Resolves { ok } when it has been heard.
+  // 44100 Hz mono) on the same sink. Resolves { ok } when it has been heard. opts.signal (AbortSignal): aborting drops
+  // this play's queued audio (other audio is untouched), stops reading the stream and resolves { ok: false, aborted: true }.
+  // What is already written to the sink (about playLeadMs) still sounds.
   play(stream, o) { return this.playback.play(stream, o); }
+
+  // Opens (true) or closes (false) the microphone; a running run ends with 'mic-lost'. With startMic: false this is the
+  // only way the mic opens (call it after start()).
+  setMic(on) {
+    if (on) this.mic.start(); else this.mic.stop();
+  }
 
   // Calls fn(Buffer) with the processed microphone audio (S16 LE, 16 kHz, mono) until the returned function is called.
   followMic(fn) { return this.mic.follow(fn); }
@@ -157,7 +169,7 @@ class Satellite extends EventEmitter {
 
   status() {
     return {
-      listening: !!this.server, connected: !!this.owner, paused: this.paused, running: !!this.run, mic: this.mic.status(),
+      listening: !!this.server, wakeStream: !!this.listening, connected: !!this.owner, paused: this.paused, running: !!this.run, mic: this.mic.status(),
       warm: !!this.playback.wake, playing: this.playback.speaking(), duckLevel: this.playback.duckLevel,
     };
   }
@@ -190,6 +202,7 @@ class Satellite extends EventEmitter {
     this.conns.delete(conn);
     if (this.owner !== conn) return;
     this.endRun('disconnected', { tell: false });
+    this.endListening('disconnected', { tell: false });
     this.disarm();
     this.playback.abortAll('disconnected');
     this.owner = null;
@@ -216,13 +229,18 @@ class Satellite extends EventEmitter {
         if (!this.paused) {
           this.paused = true;
           this.endRun('paused', { tell: false });
+          this.endListening('paused');
           this.disarm();
           this.playback.abortAll('paused');
           this.emit('paused', {});
         }
         break;
       case 'transcribe': this.emit('stt-start', { language: d.language }); break;
+      case 'detection':
+        if (this.listening) { this.emit('wake', { name: d.name }); this.playback.warmUp(); }
+        break;
       case 'transcript':
+        if (this.listening && !this.pipeline) this.arm();
         this.emit('stt-stop', { text: d.text === undefined ? '' : d.text });
         if (this.pipeline) this.pipeline.transcript = true;
         this.endRun('transcript', { tell: false });
@@ -239,6 +257,7 @@ class Satellite extends EventEmitter {
       case 'error':
         this.endRun('error', { tell: false, error: { text: d.text, code: d.code } });
         this.disarm();
+        if (this.listening) { this.playback.stopWarmUp(); this.resend(); }
         break;
       default: break; // unknown or not yet handled events are ignored, as HA does
     }
@@ -249,6 +268,7 @@ class Satellite extends EventEmitter {
       const old = this.owner;
       this.log('info', 'new satellite connection from ' + conn.address + ' replaces the one from ' + old.address);
       this.endRun('disconnected', { tell: false });
+      this.endListening('replaced', { tell: false });
       this.disarm();
       this.playback.abortAll('replaced');
       this.owner = null;
@@ -261,9 +281,11 @@ class Satellite extends EventEmitter {
       this.paused = false;
       this.log('info', 'satellite connection from ' + conn.address);
       this.emit('connected', { address: conn.address });
+      this.maybeListen();
     } else if (this.paused) {
       this.paused = false;
       this.emit('resumed', {});
+      this.maybeListen();
     }
   }
 
@@ -282,11 +304,13 @@ class Satellite extends EventEmitter {
   // ---- runs ----
 
   stream(run, buf) {
-    if (this.run !== run) return;
+    if (this.run !== run && this.listening !== run) return;
     run.pending = run.pending.length ? Buffer.concat([run.pending, buf]) : buf;
     const size = this.opts.chunkBytes;
     while (run.pending.length >= size) this.chunk(run, run.pending.slice(0, size)), run.pending = run.pending.slice(size);
-    if (run.conn.sock.writableLength > MAX_QUEUED_BYTES) this.endRun('backpressure', { tell: false });
+    if (run.conn.sock.writableLength > MAX_QUEUED_BYTES) {
+      if (run === this.listening) { this.endListening('backpressure', { tell: false }); this.relisten(2000); } else this.endRun('backpressure', { tell: false });
+    }
   }
 
   chunk(run, payload) {
@@ -311,6 +335,45 @@ class Satellite extends EventEmitter {
     this.emit('run-stop', info);
     // HA may still answer a run that ended on our side (mic lost, time-out, stopRun): keep waiting a while.
     if (['timeout', 'mic-lost', 'backpressure', 'stopped'].includes(reason) && this.pipeline) this.arm();
+  }
+
+  // ---- alwaysListen: the wake word runs in Home Assistant ----
+
+  // Starts the continuous stream (run-pipeline from the wake stage, restart_on_end) when everything allows it.
+  maybeListen() {
+    if (!this.opts.alwaysListen || !this.server || this.listening || this.run || !this.owner || this.paused) return;
+    if (!this.mic.status().on) return;
+    const conn = this.owner;
+    const l = this.listening = { conn, unfollow: null, pending: Buffer.alloc(0), sentBytes: 0 };
+    this.write(conn, 'run-pipeline', { start_stage: 'wake', end_stage: 'tts', restart_on_end: true });
+    this.write(conn, 'audio-start', Object.assign({ timestamp: 0 }, MIC_FORMAT));
+    l.unfollow = this.mic.follow((b) => this.stream(l, b));
+  }
+
+  // Home Assistant does not restart after an error: ask for a new pipeline on the same stream.
+  resend() {
+    const l = this.listening;
+    setTimeout(() => {
+      if (this.listening === l && l) this.write(l.conn, 'run-pipeline', { start_stage: 'wake', end_stage: 'tts', restart_on_end: true });
+    }, 500).unref();
+  }
+
+  relisten(ms) {
+    clearTimeout(this.relistenTimer);
+    this.relistenTimer = setTimeout(() => this.maybeListen(), ms);
+    this.relistenTimer.unref();
+  }
+
+  endListening(reason, o = {}) {
+    const l = this.listening;
+    if (!l) return;
+    this.listening = null;
+    if (l.unfollow) l.unfollow();
+    if (o.tell !== false) {
+      if (l.pending.length) this.chunk(l, l.pending);
+      this.write(l.conn, 'audio-stop', { timestamp: Math.round(l.sentBytes / 32) });
+    }
+    this.log('info', 'listening ended: ' + reason);
   }
 
   // ---- the pipeline in HA behind a run, and the audio HA sends back ----

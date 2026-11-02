@@ -347,3 +347,99 @@ test('stop() closes connections and the mic', async () => {
   await c.waitClosed();
   assert.equal(sat.micStatus().on, false);
 });
+
+test('startMic: false keeps the mic closed at start; setMic(true/false) opens and closes it', async () => {
+  const before = tv.count('voiceinput/startStreaming');
+  const sat = await makeSat({ startMic: false });
+  await sleep(400);
+  assert.equal(sat.micStatus().on, false);
+  assert.equal(tv.count('voiceinput/startStreaming'), before, 'the mic never opened at boot');
+  sat.setMic(true);
+  await until('mic on', () => sat.micStatus().on);
+  sat.setMic(true);   // twice is harmless
+  sat.setMic(false);
+  await until('mic off', () => !sat.micStatus().on);
+  assert.equal(sat.status().mic.on, false);
+});
+
+test('setMic(false) ends a running run with mic-lost', async () => {
+  const sat = await makeSat();
+  const c = await ha(sat);
+  c.send('run-satellite');
+  await until('mic', () => sat.micStatus().on);
+  await until('connected', () => sat.names().includes('connected'));
+  assert.equal(sat.startRun().started, true);
+  sat.setMic(false);
+  await until('run-stop', () => sat.names().includes('run-stop'));
+  assert.equal(sat.events.find((x) => x.name === 'run-stop').e.reason, 'mic-lost');
+});
+
+// ---- alwaysListen: the wake word runs in Home Assistant, the satellite streams the mic continuously ----
+
+test('alwaysListen: after run-satellite the satellite sends run-pipeline from the wake stage and streams the mic', async () => {
+  const sat = await makeSat({ alwaysListen: true });
+  const c = await ha(sat);
+  c.send('run-satellite');
+  const rp = (await c.waitFor('run-pipeline')).data;
+  assert.equal(rp.start_stage, 'wake');
+  assert.equal(rp.end_stage, 'tts');
+  assert.equal(rp.restart_on_end, true);
+  await c.waitFor('audio-chunk', 5);
+  assert.equal(c.of('run-pipeline').length, 1);
+  assert.equal(sat.status().wakeStream, true);
+  assert.equal(sat.status().running, false);
+  assert.deepEqual(sat.startRun(), { started: false, reason: 'run-active' });
+});
+
+test('alwaysListen: no run-pipeline while paused; resume starts streaming again; a lost mic stops it', async () => {
+  const sat = await makeSat({ alwaysListen: true });
+  const c = await ha(sat);
+  c.send('run-satellite');
+  await c.waitFor('audio-chunk', 2);
+  c.send('pause-satellite');
+  await until('paused', () => sat.names().includes('paused'));
+  await sleep(100);
+  const n = c.of('audio-chunk').length;
+  await sleep(300);
+  assert.equal(c.of('audio-chunk').length, n, 'no audio while paused');
+  c.send('run-satellite');
+  await c.waitFor('run-pipeline', 2);
+  await until('more audio', () => c.of('audio-chunk').length > n + 2);
+  sat.setMic(false);
+  await c.waitFor('audio-stop');
+  await sleep(100);
+  const m = c.of('audio-chunk').length;
+  await sleep(300);
+  assert.equal(c.of('audio-chunk').length, m);
+  sat.setMic(true);
+  await c.waitFor('run-pipeline', 3);
+});
+
+test('alwaysListen: an error from Home Assistant (no restart on its side) makes the satellite send run-pipeline again', async () => {
+  const sat = await makeSat({ alwaysListen: true });
+  const c = await ha(sat);
+  c.send('run-satellite');
+  await c.waitFor('run-pipeline');
+  c.send('error', { text: 'no text', code: 'stt-no-text-recognized' });
+  await c.waitFor('run-pipeline', 2);
+  assert.equal(c.of('audio-stop').length, 0, 'the audio keeps flowing');
+});
+
+test('alwaysListen: a detection emits wake and the transcript is followed by the answer', async () => {
+  const sat = await makeSat({ alwaysListen: true, answerTimeoutSeconds: 1 });
+  const events = [];
+  for (const n of ['wake', 'tts-start', 'played']) sat.on(n, (e) => events.push(n));
+  const c = await ha(sat);
+  c.send('run-satellite');
+  await c.waitFor('run-pipeline');
+  c.send('detection', { name: 'ok_nabu', timestamp: 0 });
+  await until('wake', () => events.includes('wake'));
+  c.send('transcribe', { language: 'en' });
+  c.send('transcript', { text: 'hello' });
+  c.send('synthesize', { text: 'hi', voice: {} });
+  c.send('audio-start', { rate: 22050, width: 2, channels: 1, timestamp: 0 });
+  c.send('audio-chunk', { rate: 22050, width: 2, channels: 1, timestamp: 0 }, Buffer.alloc(2048));
+  c.send('audio-stop', { timestamp: 0 });
+  await c.waitFor('played');
+  assert.ok(events.includes('tts-start'), 'treated as the answer, not as an announcement');
+});

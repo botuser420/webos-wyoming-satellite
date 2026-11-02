@@ -44,6 +44,7 @@ class Playback {
   }
 
   start() {
+    this.stopped = false;
     const o = this.host.opts;
     this.wakeSound = loadSound('wakeSound', o.wakeSound, this.log);
     this.doneSound = loadSound('doneSound', o.doneSound, this.log);
@@ -56,6 +57,7 @@ class Playback {
   }
 
   stop() {
+    this.stopped = true;
     this.endWarm('stopped', false);
     this.abortRx('stopped');
     if (this.guard) this.guard.stop();
@@ -74,7 +76,7 @@ class Playback {
     this.duckSetting = true;
     duck.setGlobal(this.host.luna, level, (err, value) => {
       this.duckSetting = false;
-      if (value !== undefined && value !== null) { this.duckLevel = value; this.guard.start(); }
+      if (value !== undefined && value !== null) { this.duckLevel = value; if (!this.stopped) this.guard.start(); }
       if (err) this.log('warn', 'duck level: ' + err.message);
       cb(err);
     });
@@ -90,8 +92,9 @@ class Playback {
   // Resolves { started: true } or { started: false, reason }.
   warmUp(o = {}) {
     const host = this.host.opts;
-    if (this.wake) {   // already warming: only the limit moves
+    if (this.wake) {   // already warming: the limit moves and the wake sound plays again
       this.armWarmTimer(this.wake, o.maxSeconds);
+      if (o.wakeSound !== false && this.wakeSound && this.player.isOpen) this.player.enqueue(this.wakeSound);
       return Promise.resolve({ started: true, already: true });
     }
     const w = this.wake = { token: ++this.token, timer: null, t0: Date.now(), over: false };
@@ -225,23 +228,38 @@ class Playback {
   // ---- play(stream) for the host ----
 
   async play(stream, o = {}) {
+    const signal = o.signal;
+    if (signal && signal.aborted) return { ok: false, aborted: true };
     const conv = new Converter(o.format || SINK);
     const max = this.host.opts.maxQueueSeconds * 1000;
     const player = this.player;
+    const tag = {};
+    let aborted = false;
+    let finish;
+    const result = new Promise((resolve) => { finish = resolve; });
+    const onAbort = () => {
+      aborted = true;
+      player.dropTag(tag);
+      finish({ ok: false, aborted: true });
+    };
+    if (signal) signal.addEventListener('abort', onAbort, { once: true });
     player.hold();
     try {
       player.open();
-      if (Buffer.isBuffer(stream)) player.enqueue(conv.push(stream));
+      if (Buffer.isBuffer(stream)) player.enqueue(conv.push(stream), tag);
       else {
         for await (const chunk of stream) {
-          while (player.queuedMs > max) await new Promise((r) => setTimeout(r, 50));
-          player.enqueue(conv.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)));
+          if (aborted) break;
+          while (player.queuedMs > max && !aborted) await new Promise((r) => setTimeout(r, 50));
+          if (aborted) break;
+          player.enqueue(conv.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)), tag);
         }
       }
     } finally {
       player.release();
     }
-    return new Promise((resolve) => player.mark((ok) => resolve({ ok })));
+    if (!aborted) player.mark((ok) => { if (!aborted) finish({ ok }); }, tag);
+    try { return await result; } finally { if (signal) signal.removeEventListener('abort', onAbort); }
   }
 }
 
