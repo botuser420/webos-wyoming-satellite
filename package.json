@@ -1,0 +1,10 @@
+{
+  "name": "webos-wyoming-satellite",
+  "version": "0.1.0-dev",
+  "description": "Wyoming satellite for rooted LG webOS TVs: the TV microphone as a Home Assistant voice satellite",
+  "main": "src/index.js",
+  "license": "MIT",
+  "engines": { "node": ">=20.12" },
+  "scripts": { "test": "node --test test/*.test.js" },
+  "files": ["src", "LICENSE", "README.md", "CHANGELOG.md"]
+}
