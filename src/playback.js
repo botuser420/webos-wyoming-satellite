@@ -8,9 +8,8 @@
 const { Player } = require('./player');
 const { Converter, SINK, wavToSink } = require('./pcm');
 const duck = require('./duck');
+const { AWAKE } = require('./power');
 const fs = require('node:fs');
-
-const AWAKE = { 'Active': true, 'Screen Off': true, 'Screen Saver': true };
 
 function loadSound(what, src, log) {
   if (!src) return null;

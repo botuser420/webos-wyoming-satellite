@@ -69,6 +69,15 @@ test('a connection from outside allowedHosts is closed and logged with its addre
   assert.equal(sat.events.find((x) => x.name === 'refused').e.address, '127.0.0.1');
 });
 
+test('setAllowedHosts replaces the list while running', async () => {
+  const sat = await makeSat({ allowedHosts: ['10.9.8.7'] });
+  sat.setAllowedHosts(['127.0.0.1']);
+  const c = await ha(sat);
+  c.send('describe');
+  await c.waitFor('info');
+  assert.equal(sat.events.find((x) => x.name === 'refused'), undefined);
+});
+
 test('an IPv4-mapped IPv6 peer address matches an IPv4 entry', async () => {
   const sat = await makeSat({ host: '::', allowedHosts: ['127.0.0.1'] });
   const c = await ha(sat);

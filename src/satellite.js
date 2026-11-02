@@ -9,6 +9,11 @@ const pkg = require('../package.json');
 
 const MIC_FORMAT = { rate: 16000, width: 2, channels: 1 };
 const MAX_QUEUED_BYTES = 4 * 1024 * 1024;
+// Mic audio is S16 mono at 16 kHz: 32 bytes are 1 ms.
+const BYTES_PER_MS = 32;
+// Audio that arrives after a transcript without a `synthesize` yet is either the (streamed) answer or an announce that
+// cancelled the pipeline; HA sends `synthesize` right after the first streamed audio at the latest, so wait this long for it.
+const CLASSIFY_MS = 300;
 
 function normalizeAddress(a) {
   return String(a || '').replace(/^::ffff:/i, '');
@@ -68,11 +73,17 @@ class Satellite extends EventEmitter {
     this.conns = new Set();
     this.owner = null;      // the connection that ran `run-satellite`
     this.paused = false;
+    this.hold = null;       // audio-start waiting to be told apart as answer or announce: { conn, d, events, timer }
     this.run = null;        // { conn, unfollow, timer, pending, sent }
     this.listening = null;  // alwaysListen: { conn, unfollow, pending, sentBytes }, the continuous stream for the wake word in HA
   }
 
   get port() { return this.server ? this.server.address().port : this.opts.port; }
+
+  // Replaces the list of allowed IP addresses (see `allowedHosts`) while running, for example after resolving a name.
+  setAllowedHosts(list) {
+    this.allowed = new Set((list || []).map(normalizeAddress));
+  }
 
   // Listens, warns about an open port, starts the microphone.
   start() {
@@ -99,6 +110,7 @@ class Satellite extends EventEmitter {
     this.endRun('stopped', { tell: false });
     this.endListening('stopped');
     this.disarm();
+    this.dropHold();
     this.playback.stop();
     this.mic.stop();
     for (const c of this.conns) c.sock.destroy();
@@ -116,16 +128,11 @@ class Satellite extends EventEmitter {
     if (this.paused) return { started: false, reason: 'paused' };
     if (this.run || this.listening) return { started: false, reason: 'run-active' };
     if (!this.mic.status().on) return { started: false, reason: 'mic-off' };
-    const conn = this.owner;
     const buffer = this.mic.take();
-    const run = this.run = { conn, unfollow: null, timer: null, pending: Buffer.alloc(0), sentBytes: 0 };
-    this.write(conn, 'run-pipeline', { start_stage: 'asr', end_stage: 'tts', restart_on_end: false });
-    this.write(conn, 'audio-start', Object.assign({ timestamp: 0 }, MIC_FORMAT));
-    this.stream(run, buffer);
-    run.unfollow = this.mic.follow((b) => this.stream(run, b));
+    const run = this.openStream('run', 'asr', false, buffer);
     run.timer = setTimeout(() => this.endRun('timeout'), this.opts.maxRunSeconds * 1000);
     this.arm();
-    this.emit('run-start', { bufferMs: Math.round(buffer.length / 32) });
+    this.emit('run-start', { bufferMs: Math.round(buffer.length / BYTES_PER_MS) });
     return { started: true };
   }
 
@@ -160,6 +167,9 @@ class Satellite extends EventEmitter {
   clearMic() { this.mic.clear(); }
 
   micStatus() { return this.mic.status(); }
+
+  // true / false: the TV is awake (the mic may run) by the last power poll; null when unknown.
+  micAwake() { return this.mic.awake(); }
 
   // Live settings: micChannel, micGainDb, bufferSeconds.
   configure(o) {
@@ -198,13 +208,20 @@ class Satellite extends EventEmitter {
     sock.on('close', () => this.closed(conn));
   }
 
+  // Ends everything tied to the satellite connection: the run, the wake stream (`tell`: audio-stop to HA), the wait for an
+  // answer and the audio being played.
+  release(reason, { runReason = reason, tell = false } = {}) {
+    this.endRun(runReason, { tell: false });
+    this.endListening(reason, { tell });
+    this.disarm();
+    this.dropHold();
+    this.playback.abortAll(reason);
+  }
+
   closed(conn) {
     this.conns.delete(conn);
     if (this.owner !== conn) return;
-    this.endRun('disconnected', { tell: false });
-    this.endListening('disconnected', { tell: false });
-    this.disarm();
-    this.playback.abortAll('disconnected');
+    this.release('disconnected');
     this.owner = null;
     this.paused = false;
     this.emit('disconnected', { address: conn.address, reason: 'closed' });
@@ -228,10 +245,7 @@ class Satellite extends EventEmitter {
       case 'pause-satellite':
         if (!this.paused) {
           this.paused = true;
-          this.endRun('paused', { tell: false });
-          this.endListening('paused');
-          this.disarm();
-          this.playback.abortAll('paused');
+          this.release('paused', { tell: true });
           this.emit('paused', {});
         }
         break;
@@ -248,10 +262,11 @@ class Satellite extends EventEmitter {
         break;
       case 'synthesize':
         if (this.pipeline) { this.pipeline.text = d.text === undefined ? '' : d.text; this.pipeline.voice = d.voice; this.arm(); }
+        if (this.hold) this.resolveHold();
         break;
       case 'audio-start': this.audioStart(conn, d); break;
-      case 'audio-chunk': this.playback.chunkRx(d, ev.payload); break;
-      case 'audio-stop': this.audioStop(); break;
+      case 'audio-chunk': if (this.hold) this.hold.events.push(ev); else this.playback.chunkRx(d, ev.payload); break;
+      case 'audio-stop': if (this.hold) this.hold.events.push(ev); else this.audioStop(); break;
       case 'voice-started': this.emit('voice-start', d); break;
       case 'voice-stopped': this.emit('voice-stop', d); break;
       case 'error':
@@ -267,10 +282,7 @@ class Satellite extends EventEmitter {
     if (this.owner && this.owner !== conn) {
       const old = this.owner;
       this.log('info', 'new satellite connection from ' + conn.address + ' replaces the one from ' + old.address);
-      this.endRun('disconnected', { tell: false });
-      this.endListening('replaced', { tell: false });
-      this.disarm();
-      this.playback.abortAll('replaced');
+      this.release('replaced', { runReason: 'disconnected' });
       this.owner = null;
       old.sock.destroy();
       this.conns.delete(old);
@@ -314,22 +326,40 @@ class Satellite extends EventEmitter {
   }
 
   chunk(run, payload) {
-    const timestamp = Math.round(run.sentBytes / 32);
+    const timestamp = Math.round(run.sentBytes / BYTES_PER_MS);
     run.sentBytes += payload.length;
     this.write(run.conn, 'audio-chunk', Object.assign({ timestamp }, MIC_FORMAT), payload);
   }
 
+  // Starts the mic stream for slot 'run' (one run, from the asr stage) or 'listening' (the wake word in HA, restarting):
+  // run-pipeline and audio-start, then the buffer (if any) and the live audio.
+  openStream(slot, startStage, restartOnEnd, buffer) {
+    const conn = this.owner;
+    const s = this[slot] = { conn, unfollow: null, timer: null, pending: Buffer.alloc(0), sentBytes: 0 };
+    this.write(conn, 'run-pipeline', { start_stage: startStage, end_stage: 'tts', restart_on_end: restartOnEnd });
+    this.write(conn, 'audio-start', Object.assign({ timestamp: 0 }, MIC_FORMAT));
+    if (buffer) this.stream(s, buffer);
+    s.unfollow = this.mic.follow((b) => this.stream(s, b));
+    return s;
+  }
+
+  // Stops the mic stream in the slot; `tell` (default true) flushes the rest and sends audio-stop. Returns the stream, or null.
+  closeStream(slot, o = {}) {
+    const s = this[slot];
+    if (!s) return null;
+    this[slot] = null;
+    clearTimeout(s.timer);
+    if (s.unfollow) s.unfollow();
+    if (o.tell !== false) {
+      if (s.pending.length) this.chunk(s, s.pending);
+      this.write(s.conn, 'audio-stop', { timestamp: Math.round(s.sentBytes / BYTES_PER_MS) });
+    }
+    return s;
+  }
+
   // Ends the audio of the current run. `tell`: flush the rest and send audio-stop to HA.
   endRun(reason, o = {}) {
-    const run = this.run;
-    if (!run) return;
-    this.run = null;
-    clearTimeout(run.timer);
-    if (run.unfollow) run.unfollow();
-    if (o.tell !== false) {
-      if (run.pending.length) this.chunk(run, run.pending);
-      this.write(run.conn, 'audio-stop', { timestamp: Math.round(run.sentBytes / 32) });
-    }
+    if (!this.closeStream('run', o)) return;
     const info = { reason };
     if (o.error) info.error = o.error;
     this.emit('run-stop', info);
@@ -343,11 +373,7 @@ class Satellite extends EventEmitter {
   maybeListen() {
     if (!this.opts.alwaysListen || !this.server || this.listening || this.run || !this.owner || this.paused) return;
     if (!this.mic.status().on) return;
-    const conn = this.owner;
-    const l = this.listening = { conn, unfollow: null, pending: Buffer.alloc(0), sentBytes: 0 };
-    this.write(conn, 'run-pipeline', { start_stage: 'wake', end_stage: 'tts', restart_on_end: true });
-    this.write(conn, 'audio-start', Object.assign({ timestamp: 0 }, MIC_FORMAT));
-    l.unfollow = this.mic.follow((b) => this.stream(l, b));
+    this.openStream('listening', 'wake', true);
   }
 
   // Home Assistant does not restart after an error: ask for a new pipeline on the same stream.
@@ -365,14 +391,7 @@ class Satellite extends EventEmitter {
   }
 
   endListening(reason, o = {}) {
-    const l = this.listening;
-    if (!l) return;
-    this.listening = null;
-    if (l.unfollow) l.unfollow();
-    if (o.tell !== false) {
-      if (l.pending.length) this.chunk(l, l.pending);
-      this.write(l.conn, 'audio-stop', { timestamp: Math.round(l.sentBytes / 32) });
-    }
+    if (!this.closeStream('listening', o)) return;
     this.log('info', 'listening ended: ' + reason);
   }
 
@@ -398,17 +417,45 @@ class Satellite extends EventEmitter {
     this.pipeline = null;
   }
 
-  // Audio from HA outside a run is an announcement; after a transcript (or a synthesize) it is the
-  // answer. Audio while the microphone still streams cannot be an answer: HA cancelled the run for an
-  // announce, and the run ends here.
+  // Audio from HA outside a run is an announcement; after a `synthesize` it is the answer. Audio while the
+  // microphone still streams cannot be an answer: HA cancelled the run for an announce, and the run ends here.
+  // Audio after a transcript but before any `synthesize` is either a streamed answer (HA sends `synthesize` a
+  // moment later) or an announce that cancelled the pipeline (nothing follows): it is held for CLASSIFY_MS.
   audioStart(conn, d) {
+    const p = this.pipeline;
+    if (!this.run && p && p.transcript && p.text === null) {
+      this.dropHold();
+      this.hold = { conn, d, events: [], timer: setTimeout(() => this.resolveHold(), CLASSIFY_MS) };
+      return;
+    }
+    this.beginAudio(conn, d);
+  }
+
+  resolveHold() {
+    const h = this.hold;
+    if (!h) return;
+    clearTimeout(h.timer);
+    this.hold = null;
+    this.beginAudio(h.conn, h.d);
+    for (const ev of h.events) {
+      if (ev.type === 'audio-chunk') this.playback.chunkRx(ev.data || {}, ev.payload); else this.audioStop();
+    }
+  }
+
+  dropHold() {
+    if (!this.hold) return;
+    clearTimeout(this.hold.timer);
+    this.hold = null;
+  }
+
+  beginAudio(conn, d) {
     const format = { rate: d.rate, width: d.width, channels: d.channels };
     let kind = 'announce';
     let cancelled = false;
     if (this.run) {
       this.endRun('announce', { tell: false });
       cancelled = true;
-    } else if (this.pipeline && (this.pipeline.transcript || this.pipeline.text !== null)) {
+    } else if (this.pipeline && this.pipeline.text !== null) {
       kind = 'tts';
     } else if (this.pipeline) {
       cancelled = true;

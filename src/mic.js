@@ -32,10 +32,10 @@ const { spawn } = require('node:child_process');
 const net = require('node:net');
 const { JsonStream } = require('./luna');
 
+const { AWAKE } = require('./power');
 const VOICE = 'com.webos.service.voiceinput/';
 const POWER = 'com.webos.service.tvpower/power/getPowerState';
 const VOLUME = 'com.webos.service.audio/master/getVolume';
-const AWAKE = { 'Active': true, 'Screen Off': true, 'Screen Saver': true };
 const CHANNELS = 5;
 const FRAME = CHANNELS * 2;
 const BYTES_PER_S = 16000 * 2;
